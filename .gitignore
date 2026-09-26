@@ -1,0 +1,16 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# Runtime artifacts (machine-local, never commit)
+*.log
+wifishare-state.json
+dhcp-leases.json
+
+# Editor / OS noise
+.vs/
+.vscode/
+*.user
+Desktop.ini
+Thumbs.db
