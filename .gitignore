@@ -6,6 +6,7 @@ publish/
 # Runtime artifacts (machine-local, never commit)
 *.log
 wifishare-state.json
+wifishare-state.json.tmp
 dhcp-leases.json
 
 # Editor / OS noise

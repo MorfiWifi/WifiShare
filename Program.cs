@@ -1,77 +1,24 @@
-﻿// ============================================================================
-// WifiShare — turn a Windows laptop into a network bridge / share host.
-// ----------------------------------------------------------------------------
-// SINGLE-FILE C# (.NET 10) console application. Everything lives in THIS file.
-//
-// WHAT IT DOES
-//   1. Shares the laptop's Wi-Fi internet with a client PC over Ethernet
-//      cable using Windows Internet Connection Sharing (ICS).
-//   2. Applies an exact network identity on the Ethernet adapter facing the
-//      client (static IP 172.20.10.185/24, gateway, DNS, DNS suffix,
-//      optional MAC spoof via the registry).
-//   3. Runs a built-in plug-and-play DHCP server on the Ethernet side, so the
-//      client "just works" when the cable is plugged in: it automatically
-//      receives 172.20.10.100-200, mask /24, gateway 172.20.10.185,
-//      DNS 172.16.61.20 (+ .10) and the domain suffix mydomain.net — matching
-//      preconfigured clients that only accept those names/ranges.
-//   4. Enables File/Printer Sharing + Network Discovery, creates an SMB
-//      share, and optionally runs a lightweight HTTP file server so the
-//      client can browse/download files easily.
-//
-// HOW TO COMPILE / RUN (pick one)
-//   Option A — with the tiny companion project file (recommended):
-//       dotnet run                       (from an ELEVATED terminal)
-//   Option B — .NET 10 file-based apps (no .csproj needed, SDK 10+):
-//       dotnet run Program.cs
-//   Option C — publish a single self-contained .exe (run on Windows x64):
-//       dotnet publish -c Release -r win-x64 --self-contained true ^
-//           /p:PublishSingleFile=true -o publish
-//       (then run publish\WifiShare.exe as Administrator)
-//
-// REQUIRED PERMISSIONS
-//   * Windows 10 / 11.
-//   * MUST run as Administrator (the program detects this and offers to
-//     relaunch elevated). Changing IPs, ICS, firewall rules, shares and the
-//     network-adapter registry key all require elevation.
-//
-// LIMITATIONS (read before you blame the program)
-//   * MAC spoofing: Windows lets you *suggest* a MAC by writing the
-//     "NetworkAddress" value under the adapter's registry key and restarting
-//     the adapter. Most Realtek drivers honour it, some do not (they keep
-//     the burned-in address). If it does not stick, update the driver or use
-//     the vendor utility. The program reports what the OS actually shows.
-//   * Adapter Description / Manufacturer / Driver Version (e.g. "Realtek
-//     PCIe GbE Family Controller", "1.0.0.14"): these strings come from the
-//     signed driver INF and CANNOT be changed from user mode. Any tool that
-//     claims otherwise is lying or installs an unsigned filter driver (which
-//     breaks driver-signature enforcement). The program verifies/displays
-//     them but does not fake them.
-//   * Link speed: shows the real negotiated speed; it cannot be spoofed.
-//   * "Unencrypted": Ethernet has no encryption flag to set — wired traffic
-//     is unencrypted at L2 by nature, so there is nothing to configure.
-//   * ICS ships its own DHCP allocator for 192.168.137.0/24. Our DHCP server
-//     binds EXCLUSIVELY to 172.20.10.185:67, so the two do not fight; if the
-//     ICS allocator is holding UDP 67, ours reports it and the client falls
-//     back to the static IP below. Our server also NAKs out-of-pool REQUESTs,
-//     which heals a stray 192.168.137.x lease within seconds.
-//   * Default gateway 169.254.254.254 is off-subnet for 172.20.10.0/24.
-//     Windows accepts it with a warning on most builds; if netsh refuses,
-//     the program applies the IP without a gateway and tells you.
-//
-// HOW THE CLIENT SHOULD CONNECT
-//   Option 1 — PLUG-AND-PLAY (recommended): leave the client on automatic
-//     (DHCP). Our server assigns 172.20.10.100-200 + mask + gateway
-//     172.20.10.185 + DNS 172.16.61.20 (+ .10) + domain mydomain.net.
-//   Option 2 — static IP on the client (fallback, or when preconfiguration
-//     demands a fixed address):
-//       Client IP:      172.20.10.186        (any free .2-.254 except .185)
-//       Subnet mask:    255.255.255.0
-//       Default gw:     172.20.10.185        (this laptop)
-//       DNS:            172.16.61.20  (alt. 172.16.61.10)
-//   Then on the client open:  \\172.20.10.185\Shared
-//   Or in a browser:          http://172.20.10.185:8080/   (if HTTP on)
 // ============================================================================
-
+// WifiShare — share Wi-Fi with one Ethernet client on a dedicated IPv4 subnet.
+//
+// Default CLIENT: 172.20.10.185/24. LAPTOP/gateway: 172.20.10.1/24.
+// The laptop Ethernet has NO default gateway. Internet exits through Wi-Fi.
+// WinNAT translates 172.20.10.0/24; do not run ICS or Mobile hotspot alongside it.
+// The built-in DHCP server offers .185, upstream Wi-Fi DNS and the chosen suffix.
+// It receives broadcasts on UDP 67, filters by the selected interface, and sends
+// replies on that interface. Firewall rules are scoped to the Ethernet adapter.
+//
+// Windows with WinNAT support and .NET 10; run as Administrator:
+//   dotnet run -c Release
+//   dotnet run -c Release -- --status      (read-only, no elevation required)
+//   dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true -o publish
+//
+// Keep the app open for DHCP/HTTP. Stop restores the saved address/DNS/forwarding.
+// Failed setup rolls back; failed cleanup keeps the recovery file for retry.
+// Existing ICS or Windows NAT configurations are never silently replaced.
+// Client file access: \\172.20.10.1\Shared or http://172.20.10.1:8080/
+// See README.md for client setup and checks. All application code is in this file.
+// ============================================================================
 // Explicit usings: harmless if ImplicitUsings is also enabled, and required
 // for .NET 10 file-based runs where ImplicitUsings may be off.
 using System;
@@ -116,21 +63,24 @@ catch (Exception ex)
 // ============================================================================
 internal static class Defaults
 {
-    public const string HostIp = "172.20.10.185";
+    public const string HostIp = "172.20.10.1";
+    public const string ClientIp = "172.20.10.185";
     public const string Mask = "255.255.255.0";
     public const int PrefixLength = 24;
-    public const string Gateway = "169.254.254.254";   // off-subnet: see README
+    public const string Gateway = ""; // The host's default route belongs to Wi-Fi.
     public const string DnsPrimary = "172.16.61.20";
     public const string DnsSecondary = "172.16.61.10";
     public const string DnsSuffix = "mydomain.net";
     public const string TargetMac = "88:11:1E:34:F6:41";
     // Plug-and-play DHCP pool served to the client (must sit inside 172.20.10.0/24
     // and must NOT contain the host IP .185). Lease time in hours.
-    public const string PoolStart = "172.20.10.100";
-    public const string PoolEnd = "172.20.10.200";
+    public const string PoolStart = ClientIp;
+    public const string PoolEnd = ClientIp;
     public const int LeaseHours = 24;
-    public const string SharePath = @"C:\SharedWithClient";
+    public const string SharePath = @"D:\SharedWithClient";
     public const string ShareName = "Shared";
+    public const string ShareUserName = "admin";
+    public const string SharePassword = "123456";
     public const int HttpPort = 8080;
     public const string ExpectedAdapterHint = "Realtek PCIe GbE Family Controller";
 }
@@ -140,10 +90,12 @@ internal static class Settings
 {
     public static string SharePath = Defaults.SharePath;
     public static string ShareName = Defaults.ShareName;
+    public static string ShareUserName = Defaults.ShareUserName;
+    public static string SharePassword = Defaults.SharePassword;
     public static string DnsSuffix = Defaults.DnsSuffix;
     public static int HttpPort = Defaults.HttpPort;
     public static bool StartHttpServer = true;
-    public static bool SpoofMac = true;
+    public static bool SpoofMac = false;
     // Plug-and-play DHCP (option 5 in subst: offered on Start, see DhcpServer).
     public static bool StartDhcp = true;
     public static string PoolStart = Defaults.PoolStart;
@@ -162,6 +114,12 @@ internal sealed class ShareState
     public string PrivateAdapterName { get; set; } = "";
     public string? PrivateAdapterId { get; set; }
     public bool HadStaticIp { get; set; }
+    public bool? OrigDnsAutomatic { get; set; }
+    public string HostIp { get; set; } = "";
+    public string HostMask { get; set; } = "";
+    public string? NatName { get; set; }
+    public bool OrigPublicForwarding { get; set; }
+    public bool OrigPrivateForwarding { get; set; }
     public string? OrigIp { get; set; }
     public string? OrigMask { get; set; }
     public string? OrigGateway { get; set; }
@@ -172,6 +130,8 @@ internal sealed class ShareState
     public bool OrigMacOverrideExisted { get; set; }
     public string SharePath { get; set; } = "";
     public string ShareName { get; set; } = "";
+    public bool? ShareCreatedByUs { get; set; }
+    public string ShareUserName { get; set; } = Defaults.ShareUserName;
     public string DnsSuffix { get; set; } = "";
     public int HttpPort { get; set; }
     public bool IcsEnabledByUs { get; set; }
@@ -189,7 +149,8 @@ internal static class StateStore
     public static void Save(ShareState s)
     {
         var json = JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(Path, json, Encoding.UTF8);
+        File.WriteAllText(Path + ".tmp", json, Encoding.UTF8);
+        File.Move(Path + ".tmp", Path, overwrite: true);
     }
 
     public static ShareState? Load()
@@ -251,7 +212,7 @@ internal static class Ui
 {
     public static void Banner()
     {
-        Console.Clear();
+        if (!Console.IsOutputRedirected) Console.Clear();
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine(@" __        ___  __ _   ___ _                    ");
         Console.WriteLine(@" \ \      / (_)/ _(_) / __| |__   __ _ _ __ ___  ");
@@ -259,7 +220,7 @@ internal static class Ui
         Console.WriteLine(@"   \ V  V / | |  _| | |___| | | | (_| | | |  __/ ");
         Console.WriteLine(@"    \_/\_/  |_|_| |_| |___/|_| |_|\__,_|_|  \___| ");
         Console.ResetColor();
-        Console.WriteLine("  Share laptop Wi-Fi over Ethernet  |  ICS + static identity + file share");
+        Console.WriteLine("  Share laptop Wi-Fi over Ethernet  |  Dedicated client subnet + NAT + DHCP");
         Console.WriteLine($"  Log file: {Log.FilePath}");
         Console.WriteLine(new string('=', 70));
     }
@@ -304,6 +265,29 @@ internal static class Ui
         if (string.IsNullOrWhiteSpace(input)) return defaultYes;
         input = input.Trim().ToLowerInvariant();
         return input is "y" or "yes";
+    }
+
+    public static string PromptPassword(string current)
+    {
+        Console.Write("SMB password (Enter keeps current): ");
+        if (Console.IsInputRedirected)
+        {
+            string? input = Console.ReadLine();
+            return string.IsNullOrEmpty(input) ? current : input;
+        }
+        var password = new StringBuilder();
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter) break;
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (password.Length > 0) { password.Length--; Console.Write("\b \b"); }
+            }
+            else if (!char.IsControl(key.KeyChar)) { password.Append(key.KeyChar); Console.Write('*'); }
+        }
+        Console.WriteLine();
+        return password.Length == 0 ? current : password.ToString();
     }
 
     // Simple "please wait" dots while we sleep between long operations.
@@ -375,9 +359,12 @@ internal static class Sys
     {
         if (!OperatingSystem.IsWindows())
             return new CommandResult(-1, "", "PowerShell is only available on Windows.");
+        script = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; try { " +
+                 script + "; exit 0 } catch { " +
+                 "[Console]::Error.WriteLine(('{0} [ErrorId: {1}]' -f $_.Exception.Message, $_.FullyQualifiedErrorId)); exit 1 }";
         string b64 = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
         return Run("powershell",
-            "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + b64,
+            "-NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand " + b64,
             timeoutMs);
     }
 
@@ -466,7 +453,7 @@ internal static class Adapters
                     if (d.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
                         dns.Add(d.ToString());
                 }
-                dhcp = props.DhcpServerAddresses.Count > 0;
+                dhcp = props.GetIPv4Properties()?.IsDhcpEnabled ?? false;
             }
             catch { /* one bad adapter must not hide the others */ }
 
@@ -499,6 +486,8 @@ internal static class Adapters
         int bestScore = -1;
         foreach (var a in all.Where(a => a.Type == NetworkInterfaceType.Wireless80211))
         {
+            if (a.Status != OperationalStatus.Up || !a.IPv4.Any(ip => !IsApipa(ip)) ||
+                !a.Gateways.Any(g => g != "0.0.0.0")) continue;
             int score = 0;
             if (a.Status == OperationalStatus.Up) score += 2;
             if (a.Gateways.Any(g => g != "0.0.0.0")) score += 2;
@@ -515,6 +504,7 @@ internal static class Adapters
         int bestScore = -1;
         foreach (var a in all.Where(a => a.Type == NetworkInterfaceType.Ethernet))
         {
+            if (IsVirtual(a)) continue;
             int score = 0;
             if (a.Description.Contains("Realtek", StringComparison.OrdinalIgnoreCase)) score += 2;
             if (a.Description.Contains("GbE", StringComparison.OrdinalIgnoreCase) ||
@@ -525,6 +515,14 @@ internal static class Adapters
         }
         return bestScore >= 0 ? best : null;
     }
+
+    private static bool IsVirtual(AdapterSnapshot a) =>
+        new[] { "virtual", "VMware", "Hyper-V", "TAP-", "TUN", "VPN", "Filter", "Miniport", "Kernel Debug" }
+            .Any(s => a.Description.Contains(s, StringComparison.OrdinalIgnoreCase) ||
+                      a.Name.Contains(s, StringComparison.OrdinalIgnoreCase));
+
+    public static bool ShouldRestoreStatic(AdapterSnapshot a) =>
+        !a.DhcpEnabled && a.IPv4.Any(ip => !IsApipa(ip));
 
     public static string FormatSpeed(long bps)
     {
@@ -563,18 +561,10 @@ internal static class IpConfig
 
     public static bool SetStaticIp(string iface, string ip, string mask, string? gateway)
     {
-        // NOTE: an off-subnet gateway (like 169.254.254.254 for 172.20.10.0/24)
-        // makes netsh print a warning but usually still applies the address.
         string gwPart = string.IsNullOrEmpty(gateway) ? "none" : $"{gateway} 1";
         var r = Sys.Netsh($"interface ip set address name={Q(iface)} static {ip} {mask} {gwPart}");
         Log.Info($"netsh set address -> exit {r.ExitCode}: {FirstLine(r.StdOut)} {FirstLine(r.StdErr)}".Trim());
-        if (r.Success) return true;
-
-        // Fallback: apply IP+mask without a gateway so sharing still works.
-        Log.Warn("Gateway rejected; retrying without a gateway (IP+mask only).");
-        var r2 = Sys.Netsh($"interface ip set address name={Q(iface)} static {ip} {mask} none");
-        Log.Info($"netsh set address (no gw) -> exit {r2.ExitCode}");
-        return r2.Success;
+        return r.Success; // Restoration must not silently drop a saved gateway.
     }
 
     public static bool SetDhcp(string iface)
@@ -621,6 +611,13 @@ internal static class IpConfig
     // ---- DNS suffix (connection-specific, per adapter) --------------------
     private const string TcpipIfaces =
         @"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+
+    public static bool IsDnsAutomatic(string adapterId)
+    {
+        using var key = Registry.LocalMachine.OpenSubKey($"{TcpipIfaces}\\{adapterId}");
+        if (key is null) throw new InvalidOperationException("Cannot read original Ethernet DNS configuration.");
+        return string.IsNullOrWhiteSpace(key.GetValue("NameServer") as string);
+    }
 
     public static string GetConnectionSuffix(string? adapterId)
     {
@@ -801,52 +798,56 @@ internal enum SharingConnectionEnumFlags : int { Default = 0, Public = 1, Privat
 [ComImport, Guid("5C63C1AD-3956-4FF8-8486-40034758315B")]
 internal class NetSharingManager { }
 
-[ComImport, Guid("B92F52E6-90A5-4E69-8421-525ABF359F8D")]
+// GUIDs and vtable order must match the Windows SDK NetCon.h declarations.
+[ComImport, Guid("C08956B7-1CD3-11D1-B1C5-00805FC1270E")]
 [InterfaceType(ComInterfaceType.InterfaceIsDual)]
 internal interface INetSharingManager
 {
-    bool SharingInstalled { get; }
+    bool SharingInstalled { [return: MarshalAs(UnmanagedType.VariantBool)] get; }
     [return: MarshalAs(UnmanagedType.Interface)]
     object get_EnumPublicConnections(SharingConnectionEnumFlags flags);
     [return: MarshalAs(UnmanagedType.Interface)]
     object get_EnumPrivateConnections(SharingConnectionEnumFlags flags);
-    INetSharingEveryConnectionCollection get_EnumEveryConnection();
-    // Slot kept with generic 'object' so we do not need the (undocumented
-    // here) INetConnectionProps GUID; vtable order is what matters.
-    [return: MarshalAs(UnmanagedType.Interface)]
-    object get_NetConnectionProps([MarshalAs(UnmanagedType.Interface)] INetConnection connection);
     INetSharingConfiguration get_INetSharingConfigurationForINetConnection(
+        [MarshalAs(UnmanagedType.Interface)] INetConnection connection);
+    INetSharingEveryConnectionCollection get_EnumEveryConnection();
+    INetConnectionProps get_NetConnectionProps(
         [MarshalAs(UnmanagedType.Interface)] INetConnection connection);
 }
 
-[ComImport, Guid("C08956B8-1CD3-11D1-B1C5-00805FC1270E")]
+[ComImport, Guid("33C4643C-7811-46FA-A89A-768597BD7223")]
 [InterfaceType(ComInterfaceType.InterfaceIsDual)]
 internal interface INetSharingEveryConnectionCollection
 {
-    int Count { get; }
     [DispId(-4)] IEnumerator GetEnumerator(); // _NewEnum: standard tlbimp pattern
+    int Count { get; }
+}
+
+[ComImport, Guid("C08956A1-1CD3-11D1-B1C5-00805FC1270E")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface INetConnection
+{
+    // Opaque connection handle: properties are obtained through the manager.
+    // No INetConnection methods are invoked by this application.
+}
+
+[ComImport, Guid("F4277C95-CE5B-463D-8167-5662D9BCAA72")]
+[InterfaceType(ComInterfaceType.InterfaceIsDual)]
+internal interface INetConnectionProps
+{
+    string Guid { [return: MarshalAs(UnmanagedType.BStr)] get; }
+    string Name { [return: MarshalAs(UnmanagedType.BStr)] get; }
+    string DeviceName { [return: MarshalAs(UnmanagedType.BStr)] get; }
+    int Status { get; }
+    int MediaType { get; }
+    uint Characteristics { get; }
 }
 
 [ComImport, Guid("C08956B6-1CD3-11D1-B1C5-00805FC1270E")]
 [InterfaceType(ComInterfaceType.InterfaceIsDual)]
-internal interface INetConnection
-{
-    void Connect();
-    void Disconnect();
-    [return: MarshalAs(UnmanagedType.Interface)] object Properties();
-    string DeviceName { get; }
-    int Status { get; }
-    int Type { get; }
-    uint Characteristics { get; }
-    Guid Id { get; }
-    string Name { get; }
-}
-
-[ComImport, Guid("C08956B7-1CD3-11D1-B1C5-00805FC1270E")]
-[InterfaceType(ComInterfaceType.InterfaceIsDual)]
 internal interface INetSharingConfiguration
 {
-    bool SharingEnabled { get; }
+    bool SharingEnabled { [return: MarshalAs(UnmanagedType.VariantBool)] get; }
     SharingConnectionType SharingConnectionType { get; }
     void DisableSharing();
     void EnableSharing(SharingConnectionType type);
@@ -869,13 +870,24 @@ internal static class Ics
 
     // Read one connection defensively: a single failing property must not
     // abort the whole enumeration.
-    private static (string? name, string? device, Guid id) Describe(INetConnection c)
+    private static (string? name, string? device, Guid id) Describe(INetSharingManager mgr, INetConnection c)
     {
         string? n = null, d = null;
         Guid g = Guid.Empty;
-        try { n = c.Name; } catch { }
-        try { d = c.DeviceName; } catch { }
-        try { g = c.Id; } catch { }
+        INetConnectionProps? props = null;
+        try
+        {
+            props = mgr.get_NetConnectionProps(c);
+            try { n = props.Name; } catch { }
+            try { d = props.DeviceName; } catch { }
+            try { Guid.TryParse(props.Guid, out g); } catch { }
+        }
+        catch { /* a connection may disappear during enumeration */ }
+        finally
+        {
+            if (props is not null)
+                try { Marshal.ReleaseComObject(props); } catch { }
+        }
         return (n, d, g);
     }
 
@@ -908,7 +920,7 @@ internal static class Ics
             {
                 if (o is not INetConnection c) continue;
                 rcws.Add(c);
-                var (n, d, g) = Describe(c);
+                var (n, d, g) = Describe(mgr, c);
                 Log.Info($"  Name='{n ?? "?"}'  Device='{d ?? "?"}'  Id={g}");
                 if (pub is null && IsMatch(n, d, g, publicName, publicId)) pub = c;
                 if (prv is null && IsMatch(n, d, g, privateName, privateId)) prv = c;
@@ -929,7 +941,7 @@ internal static class Ics
                     rcws.Add(cfg);
                     if (cfg.SharingEnabled)
                     {
-                        var (n, _, _) = Describe(c);
+                        var (n, _, _) = Describe(mgr, c);
                         Log.Step($"Disabling old sharing on '{n}'...");
                         cfg.DisableSharing();
                         Thread.Sleep(800);
@@ -950,14 +962,15 @@ internal static class Ics
             Thread.Sleep(1500);
 
             // Verify both ends actually report sharing.
-            bool pubOk = SafeEnabled(mgr, pub, rcws), prvOk = SafeEnabled(mgr, prv, rcws);
+            bool pubOk = SafeEnabled(mgr, pub, SharingConnectionType.Public, rcws);
+            bool prvOk = SafeEnabled(mgr, prv, SharingConnectionType.Private, rcws);
             if (pubOk && prvOk)
             {
                 message = "ICS enabled.";
                 return true;
             }
             message = $"ICS partially applied (public={pubOk}, private={prvOk}).";
-            return pubOk || prvOk;
+            return false;
         }
         catch (COMException ex)
         {
@@ -968,7 +981,7 @@ internal static class Ics
         }
         catch (Exception ex)
         {
-            message = "ICS failed: " + ex.Message;
+            message = ex.Message;
             return false;
         }
         finally
@@ -978,13 +991,14 @@ internal static class Ics
         }
     }
 
-    private static bool SafeEnabled(INetSharingManager mgr, INetConnection c, List<object> rcws)
+    private static bool SafeEnabled(INetSharingManager mgr, INetConnection c,
+                                    SharingConnectionType expected, List<object> rcws)
     {
         try
         {
             var cfg = mgr.get_INetSharingConfigurationForINetConnection(c);
             rcws.Add(cfg);
-            return cfg.SharingEnabled;
+            return cfg.SharingEnabled && cfg.SharingConnectionType == expected;
         }
         catch { return false; }
     }
@@ -1003,6 +1017,7 @@ internal static class Ics
             var every = mgr.get_EnumEveryConnection();
             rcws.Add(every);
             int count = 0;
+            int failures = 0;
             foreach (object? o in every)
             {
                 if (o is not INetConnection c) continue;
@@ -1013,17 +1028,17 @@ internal static class Ics
                     rcws.Add(cfg);
                     if (cfg.SharingEnabled)
                     {
-                        var (n, _, _) = Describe(c);
+                        var (n, _, _) = Describe(mgr, c);
                         Log.Step($"Disabling sharing on '{n}'...");
                         cfg.DisableSharing();
                         count++;
                         Thread.Sleep(500);
                     }
                 }
-                catch (Exception ex) { Log.Warn("DisableSharing note: " + ex.Message); }
+                catch (Exception ex) { failures++; Log.Warn("DisableSharing note: " + ex.Message); }
             }
-            message = count == 0 ? "No shared connections found." : $"Disabled sharing on {count} connection(s).";
-            return true;
+            message = $"Disabled sharing on {count} connection(s); {failures} failure(s).";
+            return failures == 0;
         }
         catch (Exception ex)
         {
@@ -1037,8 +1052,11 @@ internal static class Ics
         }
     }
 
-    public static List<IcsEntry> GetStatus()
+    public static List<IcsEntry> GetStatus() => GetStatus(out _);
+
+    public static List<IcsEntry> GetStatus(out string? error)
     {
+        error = null;
         var result = new List<IcsEntry>();
         if (!Sys.IsWindows()) return result;
         INetSharingManager? mgr = null;
@@ -1054,7 +1072,7 @@ internal static class Ics
             {
                 if (o is not INetConnection c) continue;
                 rcws.Add(c);
-                var (n, d, _) = Describe(c);
+                var (n, d, _) = Describe(mgr, c);
                 bool en = false;
                 string kind = "-";
                 try
@@ -1064,11 +1082,11 @@ internal static class Ics
                     en = cfg.SharingEnabled;
                     if (en) kind = cfg.SharingConnectionType == SharingConnectionType.Public ? "PUBLIC" : "PRIVATE";
                 }
-                catch { }
+                catch (Exception ex) { error = ex.Message; }
                 result.Add(new IcsEntry(n ?? "?", d ?? "?", en, kind));
             }
         }
-        catch { /* status must never throw */ }
+        catch (Exception ex) { error = ex.Message; }
         finally
         {
             foreach (var r in rcws)
@@ -1079,23 +1097,138 @@ internal static class Ics
 }
 
 // ============================================================================
+// LanPlan — one dedicated Ethernet client, with separate host/client addresses.
+// WinNAT covers exactly this subnet; no off-subnet gateway is put on the host.
+internal sealed class LanPlan
+{
+    public string HostIp { get; }
+    public string ClientIp { get; }
+    public string Prefix { get; }
+    public const string Mask = "255.255.255.0";
+
+    public LanPlan(string hostIp, string clientIp)
+    {
+        uint host = DhcpPacket.ToUInt(IPAddress.Parse(hostIp));
+        uint client = DhcpPacket.ToUInt(IPAddress.Parse(clientIp));
+        if (host == client) throw new ArgumentException("Laptop and client must have different IP addresses.");
+        if ((host & 0xffffff00) != (client & 0xffffff00))
+            throw new ArgumentException("Laptop and client must be in the same /24 subnet.");
+        foreach (uint ip in new[] { host, client })
+            if ((ip & 255) is 0 or 255 || (ip >> 24) is 0 or 127 or >= 224 ||
+                (ip >> 16) == 0xa9fe)
+                throw new ArgumentException("Use usable unicast addresses, not network, broadcast or link-local addresses.");
+        HostIp = IPAddress.Parse(hostIp).ToString();
+        ClientIp = IPAddress.Parse(clientIp).ToString();
+        Prefix = DhcpPacket.ToIp(host & 0xffffff00) + "/24";
+    }
+
+    public bool Overlaps(AdapterSnapshot adapter)
+    {
+        uint target = DhcpPacket.ToUInt(IPAddress.Parse(HostIp)) & 0xffffff00;
+        for (int i = 0; i < adapter.IPv4.Count; i++)
+        {
+            if (i >= adapter.Masks.Count || !IPAddress.TryParse(adapter.Masks[i], out var mask)) continue;
+            uint other = DhcpPacket.ToUInt(IPAddress.Parse(adapter.IPv4[i]));
+            uint commonMask = DhcpPacket.ToUInt(mask) & 0xffffff00;
+            if ((target & commonMask) == (other & commonMask)) return true;
+        }
+        return false;
+    }
+}
+
+internal static class LanNat
+{
+    // Windows on the target host rejects the old 42-character name with error
+    // 122. This short ASCII form was verified with the actual WinNAT provider.
+    public static string CreateName() => "WS-" + Guid.NewGuid().ToString("N")[..8];
+
+    public static void Require(CommandResult result, string operation)
+    {
+        if (!result.Success)
+            throw new InvalidOperationException(operation + ": " + result.StdErr + " " + result.StdOut);
+    }
+
+    public static void Preflight(AdapterSnapshot wifi, AdapterSnapshot ethernet, bool dhcp)
+    {
+        var sharing = Ics.GetStatus(out string? error);
+        if (error is not null) throw new InvalidOperationException("Cannot inspect ICS: " + error);
+        if (sharing.Any(e => e.Enabled))
+            throw new InvalidOperationException("ICS is already enabled. Stop the existing sharing session or disable " +
+                "the Wi-Fi Sharing checkbox / Mobile hotspot first. ICS and this custom-subnet NAT must not run together.");
+        Require(Sys.PowerShell(
+            "Get-Command New-NetNat -ErrorAction Stop | Out-Null; " +
+            "if (@(Get-NetNat -ErrorAction Stop).Count -ne 0) { throw 'An existing Windows NAT is configured. " +
+            "WifiShare will not replace another app or VM network.' }; " +
+            "$route = Find-NetRoute -RemoteIPAddress '1.1.1.1' | Select-Object -First 1; " +
+            $"$wifi = Get-NetAdapter -Name {Sys.PwshQuote(wifi.Name)}; " +
+            "if ($route.InterfaceIndex -ne $wifi.ifIndex) { throw 'The default internet route does not use the selected Wi-Fi. Check VPN/default routes first.' }"),
+            "Custom subnet routing is unavailable (requires Windows WinNAT)");
+        if (dhcp)
+        {
+            using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            probe.ExclusiveAddressUse = true;
+            try { probe.Bind(new IPEndPoint(IPAddress.Any, 67)); }
+            catch (SocketException ex)
+            {
+                throw new InvalidOperationException("Cannot listen for DHCP broadcasts on UDP 67. " +
+                    "Stop the conflicting DHCP server / Mobile hotspot, or choose static client configuration. " + ex.Message);
+            }
+        }
+    }
+
+    public static bool GetForwarding(string name)
+    {
+        var r = Sys.PowerShell($"(Get-NetIPInterface -InterfaceAlias {Sys.PwshQuote(name)} " +
+                               "-AddressFamily IPv4).Forwarding.ToString()");
+        Require(r, "Read forwarding for " + name);
+        return r.StdOut.Trim().Equals("Enabled", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void Create(ShareState state, LanPlan plan)
+    {
+        Log.Step($"Enable IPv4 forwarding on '{state.PrivateAdapterName}'");
+        Require(Sys.PowerShell(
+            $"Set-NetIPInterface -InterfaceAlias {Sys.PwshQuote(state.PrivateAdapterName)} -AddressFamily IPv4 -Forwarding Enabled"),
+            "Set-NetIPInterface (Ethernet forwarding)");
+        Log.Step($"Enable IPv4 forwarding on '{state.PublicAdapterName}'");
+        Require(Sys.PowerShell(
+            $"Set-NetIPInterface -InterfaceAlias {Sys.PwshQuote(state.PublicAdapterName)} -AddressFamily IPv4 -Forwarding Enabled"),
+            "Set-NetIPInterface (Wi-Fi forwarding)");
+        Log.Step($"Create NAT '{state.NatName}' for {plan.Prefix}");
+        Require(Sys.PowerShell(
+            $"New-NetNat -Name {Sys.PwshQuote(state.NatName!)} -InternalIPInterfaceAddressPrefix {Sys.PwshQuote(plan.Prefix)} | Out-Null"),
+            $"New-NetNat (name='{state.NatName}', prefix='{plan.Prefix}')");
+        Require(Sys.PowerShell(
+            $"$nat = Get-NetNat -Name {Sys.PwshQuote(state.NatName!)}; " +
+            $"if (-not $nat.Active -or $nat.InternalIPInterfaceAddressPrefix -ne {Sys.PwshQuote(plan.Prefix)}) {{ throw 'NAT did not become active with the requested subnet.' }}"),
+            "Verify NAT state");
+    }
+
+    public static bool Restore(ShareState state)
+    {
+        var r = Sys.PowerShell(
+            $"Get-NetNat | Where-Object Name -eq {Sys.PwshQuote(state.NatName!)} | Remove-NetNat -Confirm:$false; " +
+            $"Set-NetIPInterface -InterfaceAlias {Sys.PwshQuote(state.PrivateAdapterName)} -AddressFamily IPv4 -Forwarding {(state.OrigPrivateForwarding ? "Enabled" : "Disabled")}; " +
+            $"Set-NetIPInterface -InterfaceAlias {Sys.PwshQuote(state.PublicAdapterName)} -AddressFamily IPv4 -Forwarding {(state.OrigPublicForwarding ? "Enabled" : "Disabled")}");
+        if (!r.Success) Log.Error("Restore NAT/forwarding: " + r.StdErr);
+        return r.Success;
+    }
+}
+
+// ============================================================================
 // Sharing — firewall rules, helper services, SMB share, HTTP firewall port.
 // ============================================================================
 internal static class Sharing
 {
     public static void EnsureFirewallAndServices()
     {
-        Log.Step("Enabling File and Printer Sharing + Network Discovery firewall rules...");
-        var r1 = Sys.Netsh(@"advfirewall firewall set rule group=""File and Printer Sharing"" new enable=Yes");
-        Log.Info($"File/Printer Sharing rule -> exit {r1.ExitCode}");
-        var r2 = Sys.Netsh(@"advfirewall firewall set rule group=""Network Discovery"" new enable=Yes");
-        Log.Info($"Network Discovery rule -> exit {r2.ExitCode}");
-        if (!r1.Success || !r2.Success)
-            Log.Warn("One or more firewall groups could not be enabled (see above).");
+        Log.Step("Starting file sharing and Network Discovery services...");
+        // ConfigureLanRules installs interface-scoped rules; do not enable
+        // global built-in groups on unrelated Wi-Fi or VPN networks.
 
         // Helper services file sharing depends on. 'sc config/start' works
         // on every Windows edition without extra APIs.
-        foreach (var svc in new[] { "LanmanServer", "SSDPSRV", "FDResPub" })
+        foreach (var svc in new[] { "LanmanServer", "SSDPSRV", "fdPHost", "FDResPub" })
         {
             var c = Sys.Run("sc", $"config {svc} start= auto", 30_000);
             var s = Sys.Run("sc", $"start {svc}", 30_000);
@@ -1106,36 +1239,94 @@ internal static class Sharing
         }
     }
 
-    // Create (or recreate) an SMB share with full access for Everyone.
-    // Uses the Everyone SID (*S-1-1-0) for icacls so it works on any locale.
+    public static void ValidateShareCredentials(string userName, string password)
+    {
+        if (string.IsNullOrWhiteSpace(userName) || userName.Length > 20 ||
+            userName.EndsWith('.') || userName.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not '_' and not '-' and not '.'))
+            throw new ArgumentException("Share username must be 1-20 letters, digits, dots, underscores or hyphens, and must not end in a dot.");
+        if (string.IsNullOrEmpty(password))
+            throw new ArgumentException("The SMB account needs a non-empty password.");
+    }
+
+    // Only a SID recorded by this app may have its password reset on later runs.
+    // Never adopt an unrelated local account just because its name matches.
+    internal static string BuildShareScript(string folder, string shareName, string userName, string password)
+    {
+        ValidateShareCredentials(userName, password);
+        return $$"""
+            $folder = {{Sys.PwshQuote(Path.GetFullPath(folder))}}
+            $shareName = {{Sys.PwshQuote(shareName)}}
+            $userName = {{Sys.PwshQuote(userName)}}
+            $existing = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
+            if ($existing -and [IO.Path]::GetFullPath($existing.Path).TrimEnd('\') -ne $folder.TrimEnd('\')) {
+                throw 'The share name already points to a different folder. Choose a different share name.'
+            }
+            $registryPath = 'HKLM:\SOFTWARE\WifiShare\ShareAccounts'
+            $knownSid = Get-ItemPropertyValue -LiteralPath $registryPath -Name $userName -ErrorAction SilentlyContinue
+            $user = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+            if ($user -and $user.SID.Value -ne $knownSid) {
+                throw "Local account '$userName' already exists and is not managed by WifiShare. Choose another share username in Settings."
+            }
+            $secret = ConvertTo-SecureString {{Sys.PwshQuote(password)}} -AsPlainText -Force
+            try {
+                if ($user) {
+                    $isAdmin = Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID.Value -eq $user.SID.Value }
+                    if ($isAdmin) { throw 'The managed share account has administrator privileges. Choose a different standard account name.' }
+                    Set-LocalUser -SID $user.SID -Password $secret -PasswordNeverExpires $true
+                    Enable-LocalUser -SID $user.SID
+                } else {
+                    $user = New-LocalUser -Name $userName -Password $secret -PasswordNeverExpires -AccountNeverExpires -Description 'WifiShare SMB access account'
+                    try {
+                        New-Item -Path $registryPath -Force | Out-Null
+                        New-ItemProperty -LiteralPath $registryPath -Name $userName -Value $user.SID.Value -PropertyType String -Force | Out-Null
+                    } catch {
+                        Remove-LocalUser -SID $user.SID
+                        throw
+                    }
+                }
+            } finally { $secret.Dispose() }
+            $members = @(Get-LocalGroupMember -SID 'S-1-5-32-545')
+            if (-not ($members | Where-Object { $_.SID.Value -eq $user.SID.Value })) {
+                Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user
+            }
+            $account = "$env:COMPUTERNAME\$userName"
+            $admins = ([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+            $everyone = ([Security.Principal.SecurityIdentifier]'S-1-1-0').Translate([Security.Principal.NTAccount]).Value
+            [IO.Directory]::CreateDirectory($folder) | Out-Null
+            & icacls.exe $folder /grant ("*" + $user.SID.Value + ':(OI)(CI)M') /T /Q
+            if ($LASTEXITCODE -ne 0) { throw "NTFS access grant failed (icacls exit $LASTEXITCODE)." }
+            if ($existing) {
+                Grant-SmbShareAccess -Name $shareName -AccountName $account -AccessRight Change -Force | Out-Null
+                Grant-SmbShareAccess -Name $shareName -AccountName $admins -AccessRight Full -Force | Out-Null
+                Revoke-SmbShareAccess -Name $shareName -AccountName $everyone -Force | Out-Null
+            } else {
+                New-SmbShare -Name $shareName -Path $folder -ChangeAccess $account -FullAccess $admins -FolderEnumerationMode AccessBased | Out-Null
+            }
+            """;
+    }
+
     public static bool EnsureShare(string folder, string shareName)
     {
         try
         {
-            Directory.CreateDirectory(folder);
-            Log.Ok($"Folder ready: {folder}");
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Cannot create folder: " + ex.Message);
-            return false;
-        }
-
-        var acl = Sys.Run("icacls", $"\"{folder}\" /grant *S-1-1-0:(OI)(CI)F /T /Q", 60_000);
-        Log.Info($"icacls -> exit {acl.ExitCode}");
-        if (!acl.Success) Log.Warn("icacls failed; share may be read-only for guests.");
-
-        Sys.Run("net", $"share {shareName} /delete /y", 30_000); // ignore errors
-        var r = Sys.Run("net",
-            $"share {shareName}=\"{folder}\" /GRANT:Everyone,FULL /REMARK:\"WifiShare file drop\"", 60_000);
-        if (r.Success)
-        {
-            Log.Ok($"SMB share created: \\\\{Environment.MachineName}\\{shareName}");
+            var result = Sys.PowerShell(BuildShareScript(folder, shareName, Settings.ShareUserName, Settings.SharePassword));
+            if (!result.Success)
+            {
+                Log.Error("SMB account/share setup failed: " + result.StdErr);
+                return false;
+            }
+            Log.Ok($"SMB share ready: \\\\{Environment.MachineName}\\{shareName}; user {Environment.MachineName}\\{Settings.ShareUserName}");
             return true;
         }
-        Log.Error($"net share failed (exit {r.ExitCode}): {r.StdOut} {r.StdErr}");
-        Log.Info("Fallback: right-click the folder > Properties > Sharing > Advanced Sharing.");
-        return false;
+        catch (Exception ex) { Log.Error("SMB setup failed: " + ex.Message); return false; }
+    }
+
+    public static void PrintShareLogin(string hostIp, string shareName)
+    {
+        Console.WriteLine($"SMB username: {Environment.MachineName}\\{Settings.ShareUserName}");
+        Console.WriteLine($"SMB password: {Settings.SharePassword}");
+        Console.WriteLine($"Client command: net use \\\\{hostIp}\\{shareName} /user:{Environment.MachineName}\\{Settings.ShareUserName} *");
+        Console.WriteLine("Enter the password at the prompt. If Windows cached another login, disconnect that share and reconnect.");
     }
 
     public static void RemoveShare(string shareName)
@@ -1150,17 +1341,43 @@ internal static class Sharing
         return r.Success ? r.StdOut : "(could not query shares)";
     }
 
-    public static void OpenHttpPort(int port, bool open)
+    public static bool ConfigureLanRules(string adapterName, bool open)
+    {
+        string script = "Get-NetFirewallRule -Name 'WifiShare-Smb','WifiShare-DiscoveryUdp','WifiShare-DiscoveryTcp','WifiShare-Ping' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; ";
+        if (open)
+        {
+            string scope = $" -InterfaceAlias {Sys.PwshQuote(adapterName)} -Profile Any -Direction Inbound -Action Allow -RemoteAddress LocalSubnet ";
+            script += "New-NetFirewallRule -Name 'WifiShare-Smb' -DisplayName 'WifiShare LAN files' -Protocol TCP -LocalPort 445" + scope + "| Out-Null; " +
+                      "New-NetFirewallRule -Name 'WifiShare-DiscoveryUdp' -DisplayName 'WifiShare LAN discovery UDP' -Protocol UDP -LocalPort 3702" + scope + "| Out-Null; " +
+                      "New-NetFirewallRule -Name 'WifiShare-DiscoveryTcp' -DisplayName 'WifiShare LAN discovery TCP' -Protocol TCP -LocalPort 5357,5358" + scope + "| Out-Null; " +
+                      "New-NetFirewallRule -Name 'WifiShare-Ping' -DisplayName 'WifiShare LAN ping' -Protocol ICMPv4 -IcmpType 8" + scope + "| Out-Null";
+        }
+        var result = Sys.PowerShell(script);
+        if (!result.Success) Log.Warn("LAN firewall rules: " + result.StdErr);
+        return result.Success;
+    }
+
+    public static void OpenHttpPort(int port, bool open, string? adapterName = null)
     {
         string rule = $"WifiShare HTTP {port}";
         if (open)
         {
+            if (adapterName is not null)
+            {
+                var scoped = Sys.PowerShell(
+                    $"Get-NetFirewallRule -Name 'WifiShare-Http-{port}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; " +
+                    $"New-NetFirewallRule -Name 'WifiShare-Http-{port}' -DisplayName {Sys.PwshQuote(rule)} " +
+                    $"-Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} -InterfaceAlias {Sys.PwshQuote(adapterName)} -RemoteAddress LocalSubnet -Profile Any | Out-Null");
+                if (!scoped.Success) Log.Warn("HTTP firewall: " + scoped.StdErr);
+                return;
+            }
             var r = Sys.Netsh($"advfirewall firewall add rule name=\"{rule}\" dir=in action=allow " +
                               $"protocol=TCP localport={port} profile=private");
             Log.Info($"HTTP firewall rule -> exit {r.ExitCode}");
         }
         else
         {
+            Sys.PowerShell($"Get-NetFirewallRule -Name 'WifiShare-Http-{port}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule");
             Sys.Netsh($"advfirewall firewall delete rule name=\"{rule}\" protocol=TCP localport={port}");
         }
     }
@@ -1169,44 +1386,29 @@ internal static class Sharing
     // Inbound 67 must be open on the Private profile; outbound answers to a
     // broadcast address are allowed by default, but we open 68 too so a
     // locked-down firewall cannot break renewals.
-    public static void OpenDhcpPort(bool open)
+    public static bool OpenDhcpPort(bool open, string? adapterName = null)
     {
-        const string rule = "WifiShare DHCP";
+        string script = "Get-NetFirewallRule -Name 'WifiShare-Dhcp-In','WifiShare-Dhcp-Out' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; ";
         if (open)
         {
-            var r = Sys.Netsh($"advfirewall firewall add rule name=\"{rule}\" dir=in action=allow " +
-                              "protocol=UDP localport=67 profile=private");
-            Log.Info($"DHCP firewall rule -> exit {r.ExitCode}");
+            if (string.IsNullOrWhiteSpace(adapterName)) return false;
+            string nic = Sys.PwshQuote(adapterName);
+            script += $"New-NetFirewallRule -Name 'WifiShare-Dhcp-In' -DisplayName 'WifiShare DHCP receive' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 67 -RemotePort 68 -InterfaceAlias {nic} -Profile Any | Out-Null; " +
+                      $"New-NetFirewallRule -Name 'WifiShare-Dhcp-Out' -DisplayName 'WifiShare DHCP reply' -Direction Outbound -Action Allow -Protocol UDP -LocalPort 67 -RemotePort 68 -InterfaceAlias {nic} -Profile Any | Out-Null";
         }
-        else
-        {
-            Sys.Netsh($"advfirewall firewall delete rule name=\"{rule}\" protocol=UDP localport=67");
-        }
+        var r = Sys.PowerShell(script);
+        if (!r.Success) Log.Error("DHCP firewall: " + r.StdErr);
+        if (!open) Sys.Netsh("advfirewall firewall delete rule name=\"WifiShare DHCP\" protocol=UDP localport=67"); // legacy rule
+        return r.Success;
     }
 }
 
 // ============================================================================
-// DHCP — minimal plug-and-play server (RFC 2131 subset) so the client "just
-// works" when the cable is plugged in.
-//
-// WHY OUR OWN DHCP SERVER? The built-in ICS allocator only serves the
-// hardcoded 192.168.137.0/24 range (its scope lives in the undocumented
-// SharedAccess\Parameters registry keys and behaves differently per Windows
-// build), offers ITSELF as DNS, and never sends a domain name. A client with
-// preconfiguration (expects 172.20.10.x, DNS 172.16.61.20, domain
-// mydomain.net) would reject all of that. Our server offers exactly:
-//   pool 172.20.10.100-200, mask /24, router 172.20.10.185,
-//   DNS 172.16.61.20 (+ .10), domain mydomain.net, 24 h leases.
-// It also NAKs out-of-pool REQUESTs, which heals a stray 192.168.137.x lease
-// (from the ICS allocator, if it ever answers) within seconds.
-//
-// CONFLICT NOTE: only one program can own UDP port 67 per interface. We bind
-// EXCLUSIVELY to 172.20.10.185:67 so we never steal DHCP on the Wi-Fi side.
-// If the bind fails, the ICS allocator is holding the port: the program logs
-// remediation steps and continues (client falls back to static IP).
-// No NuGet, no P/Invoke: one UDP Socket + manual packet codec below.
+// DHCP — single-client address assignment for the WinNAT subnet.
+// A wildcard bind receives initial broadcasts; IP_PKTINFO restricts input to
+// the selected adapter and IP_UNICAST_IF selects the outgoing Windows interface.
+// ICS must be off. An exclusive UDP 67 bind detects competing DHCP servers.
 // ============================================================================
-
 // Fixed configuration for one DHCP scope (validated in the constructor).
 internal sealed class DhcpScope
 {
@@ -1230,7 +1432,13 @@ internal sealed class DhcpScope
         Dns = dns; Domain = domain ?? "";
         PoolStart = poolStart; PoolEnd = poolEnd; LeaseSeconds = leaseSeconds;
 
+        if (dns.Count > 63 || Encoding.ASCII.GetByteCount(Domain) > 253)
+            throw new ArgumentException("DHCP DNS list or domain is too long.");
+        foreach (var address in dns.Append(router)) DhcpPacket.ToUInt(address);
         uint m = DhcpPacket.ToUInt(mask);
+        uint inverse = ~m;
+        if (m == 0 || (inverse & (inverse + 1)) != 0)
+            throw new ArgumentException("DHCP subnet mask must be contiguous and nonzero.");
         uint net = DhcpPacket.ToUInt(serverIp) & m;
         Broadcast = DhcpPacket.ToIp(net | ~m);
         // Pool must be a sane range inside our own subnet.
@@ -1304,6 +1512,7 @@ internal static class DhcpPacket
     {
         if (buf is null || len < 240 || buf.Length < len) return null;
         if (buf[0] != 1 || buf[1] != 1 || buf[2] != 6) return null; // op/htype/hlen
+        if (ReadU32(buf, 24) != 0) return null; // dedicated LAN only; no DHCP relays
         if (buf[236] != 99 || buf[237] != 130 || buf[238] != 83 || buf[239] != 99) return null;
         var m = new Message
         {
@@ -1394,6 +1603,7 @@ internal sealed class DhcpServer : IDisposable
     private readonly int _peerPort;        // 68 in production
     private readonly bool _broadcastReplies; // false = unicast to sender (tests)
     private readonly string _leaseFile;
+    private int _interfaceIndex;
     private Socket? _sock;
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -1424,30 +1634,37 @@ internal sealed class DhcpServer : IDisposable
             LoadLeases();
             Stop(); // idempotent
             var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            _sock = sock; // ensure failed setup is disposed as well
             // Exclusive bind: fail loudly on conflict instead of fighting another server.
             sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ExclusiveAddressUse, true);
             sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
             sock.ReceiveTimeout = 1000; // lets the loop notice cancellation promptly
-            // Bind ONLY our Ethernet IP: never answer DHCP on the Wi-Fi side.
-            sock.Bind(new IPEndPoint(_scope.ServerIp, _listenPort));
-            _sock = sock;
+            var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n =>
+                n.GetIPProperties().UnicastAddresses.Any(a => a.Address.Equals(_scope.ServerIp)))
+                ?? throw new InvalidOperationException("The DHCP server address is not assigned to a local adapter.");
+            _interfaceIndex = nic.GetIPProperties().GetIPv4Properties()!.Index;
+            sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+            if (OperatingSystem.IsWindows())
+                sock.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, // Windows IP_UNICAST_IF
+                    IPAddress.HostToNetworkOrder(_interfaceIndex));
+            // Address-less clients send to 255.255.255.255. A unicast-only bind
+            // misses those requests. Packet information restricts input to LAN.
+            sock.Bind(new IPEndPoint(IPAddress.Any, _listenPort));
             _cts = new CancellationTokenSource();
-            _loop = Task.Run(() => RecvLoop(_cts.Token));
+            var token = _cts.Token;
             Running = true;
+            _loop = Task.Run(() => RecvLoop(sock, token));
             message = $"serving {PoolSummary} on {_scope.ServerIp}:{_listenPort}";
             return true;
         }
         catch (SocketException ex)
         {
-            message = $"UDP {_scope.ServerIp}:{_listenPort} is busy (error {ex.ErrorCode}). " +
-                      (_listenPort == 67
-                        ? "Another DHCP server (usually the ICS built-in allocator) holds port 67. " +
-                          "Remedy: Stop sharing, disable/re-enable ICS, reboot, then Start again. " +
-                          "The client can still use the static IP from the instructions."
-                        : ex.Message);
+            Stop();
+            message = $"DHCP socket failed ({ex.SocketErrorCode}): {ex.Message}. " +
+                      "Check for another DHCP server or Mobile hotspot holding UDP 67.";
             return false;
         }
-        catch (Exception ex) { message = ex.Message; return false; }
+        catch (Exception ex) { Stop(); message = ex.Message; return false; }
     }
 
     public void Stop()
@@ -1473,14 +1690,20 @@ internal sealed class DhcpServer : IDisposable
     }
 
     // ---- receive loop -------------------------------------------------------
-    private void RecvLoop(CancellationToken ct)
+    private void RecvLoop(Socket socket, CancellationToken ct)
     {
         var buf = new byte[1500];
         while (!ct.IsCancellationRequested)
         {
             EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
             int n;
-            try { n = _sock!.ReceiveFrom(buf, ref remote); }
+            try
+            {
+                SocketFlags flags = SocketFlags.None;
+                n = socket.ReceiveMessageFrom(buf, 0, buf.Length, ref flags, ref remote, out var info);
+                if (!AcceptInterface(info.Interface, _interfaceIndex)) continue;
+                if (_listenPort == 67 && ((IPEndPoint)remote).Port != 68) continue;
+            }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut) { continue; }
             catch (ObjectDisposedException) { break; }
             catch (SocketException) { if (ct.IsCancellationRequested) break; continue; }
@@ -1488,7 +1711,10 @@ internal sealed class DhcpServer : IDisposable
             try { Handle(buf, n, remote); }
             catch (Exception ex) { Log.Warn("DHCP handler error: " + ex.Message); }
         }
+        Running = false;
     }
+
+    internal static bool AcceptInterface(int received, int selected) => selected > 0 && received == selected;
 
     private void Handle(byte[] buf, int n, EndPoint remote)
     {
@@ -1655,6 +1881,7 @@ internal sealed class DhcpServer : IDisposable
     {
         if (!InSubnet(ip)) return false;
         uint v = DhcpPacket.ToUInt(IPAddress.Parse(ip));
+        if (v < DhcpPacket.ToUInt(_scope.PoolStart) || v > DhcpPacket.ToUInt(_scope.PoolEnd)) return false;
         uint net = DhcpPacket.ToUInt(_scope.ServerIp) & DhcpPacket.ToUInt(_scope.Mask);
         uint bcast = DhcpPacket.ToUInt(_scope.Broadcast);
         if (v == net || v == bcast) return false;                 // network/broadcast
@@ -1748,7 +1975,8 @@ internal sealed class DhcpServer : IDisposable
             lock (_gate)
             {
                 foreach (var l in list)
-                    if (!string.IsNullOrEmpty(l.Mac) && !string.IsNullOrEmpty(l.Ip))
+                    if (!string.IsNullOrEmpty(l.Mac) && IPAddress.TryParse(l.Ip, out var ip) &&
+                        ip.AddressFamily == AddressFamily.InterNetwork && IsOfferableLocked(l.Ip, l.Mac))
                         _leases[l.Mac] = l;
                 PruneLocked();
             }
@@ -1773,18 +2001,20 @@ internal sealed class HttpFileServer : IDisposable
 {
     private readonly string _root;
     private readonly int _port;
+    private readonly string _hostIp;
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private bool _disposed;
 
     public bool Running { get; private set; }
-    public string Url => $"http://{Defaults.HostIp}:{_port}/";
+    public string Url => $"http://{_hostIp}:{_port}/";
 
-    public HttpFileServer(string root, int port)
+    public HttpFileServer(string root, int port, string? hostIp = null)
     {
         _root = System.IO.Path.GetFullPath(root);
         _port = port;
+        _hostIp = hostIp ?? Defaults.HostIp;
     }
 
     public bool Start(out string message)
@@ -1958,7 +2188,7 @@ internal static class ClientHelp
                              string dns1, string dns2,
                              bool dhcpOn, string poolStart, string poolEnd, string domain)
     {
-        string clientIp = SuggestClientIp(hostIp);
+        string clientIp = poolStart;
         Ui.Section("CLIENT SETUP (do this on the client PC)");
         Console.WriteLine("1. Plug the Ethernet cable laptop <-> client.");
         if (dhcpOn)
@@ -1988,7 +2218,13 @@ internal static class ClientHelp
         Console.WriteLine($"     \\\\{hostIp}\\{shareName}      (File Explorer address bar)");
         if (httpOn) Console.WriteLine($"     http://{hostIp}:{httpPort}/   (any browser)");
         Console.ResetColor();
-        Console.WriteLine("4. Internet on the client flows through this laptop (ICS/NAT).");
+        Console.WriteLine("4. On the client, run ipconfig /all and check the address, gateway and DNS above.");
+        Console.WriteLine("   For DHCP, set IPv4 AND DNS to automatic, then run ipconfig /renew on the client.");
+        Console.WriteLine("   A 169.254.x.x address means the client did not obtain a DHCP lease.");
+        Console.WriteLine($"5. Test: ping {hostIp}, then ping 1.1.1.1, then nslookup example.com.");
+        Console.WriteLine("   ICMP can be blocked; also try the HTTP link and a website in a browser.");
+        Console.WriteLine("   File Explorer Network discovery is separate: use the direct share address above.");
+        Console.WriteLine("Keep this app open while DHCP or HTTP service is needed.");
     }
 }
 
@@ -2014,7 +2250,7 @@ internal static class WifiShareApp
 
         if (!Sys.IsWindows())
         {
-            Log.Warn("This tool manages Windows networking (netsh / ICS / registry).");
+            Log.Warn("This tool manages Windows networking (WinNAT / DHCP / netsh).");
             Log.Warn($"You are on {RuntimeInformation.OSDescription}; sharing actions are disabled.");
             Ui.Banner();
             var all = Adapters.ListAll(); // cross-platform part still works
@@ -2023,11 +2259,14 @@ internal static class WifiShareApp
             return 2;
         }
 
+        // Read-only diagnostics are useful even before elevation is available.
+        if (argSet.Contains("--status")) { Ui.Banner(); ShowStatus(); return 0; }
+
         // Must be admin: offer to relaunch elevated, preserving CLI args.
         if (!Sys.IsAdmin())
         {
             Ui.Banner();
-            Log.Warn("Administrator rights are required (IP, ICS, firewall, shares, registry).");
+            Log.Warn("Administrator rights are required (IP, NAT, firewall and shares).");
             string joined = string.Join(" ", args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a));
             if (Ui.PromptYesNo("Relaunch as Administrator now?", true))
             {
@@ -2037,6 +2276,21 @@ internal static class WifiShareApp
             }
             Log.Error("Continuing without admin will fail. Exiting.");
             return 1;
+        }
+
+        // Update credentials on a running share without stopping NAT/DHCP.
+        if (argSet.Contains("--setup-share"))
+        {
+            var session = StateStore.Load();
+            if (session is not null)
+            {
+                Settings.SharePath = session.SharePath;
+                Settings.ShareName = session.ShareName;
+                Settings.ShareUserName = session.ShareUserName;
+            }
+            if (!Sharing.EnsureShare(Settings.SharePath, Settings.ShareName)) return 1;
+            Sharing.PrintShareLogin(session?.HostIp is { Length: > 0 } address ? address : Defaults.HostIp, Settings.ShareName);
+            return 0;
         }
 
         // Ctrl+C: try to leave the machine clean instead of abandoning ICS+IP.
@@ -2049,8 +2303,13 @@ internal static class WifiShareApp
         };
 
         // Non-interactive flags (scripting friendly).
-        if (argSet.Contains("--status")) { Ui.Banner(); ShowStatus(); return 0; }
-        if (argSet.Contains("--start")) { Ui.Banner(); StartSharing(); return _sharingActive ? 0 : 1; }
+        if (argSet.Contains("--start"))
+        {
+            Ui.Banner(); StartSharing();
+            if (!_sharingActive) return 1;
+            MenuLoop(); // keep the DHCP/HTTP workers alive until the user exits
+            return 0;
+        }
         if (argSet.Contains("--stop")) { Ui.Banner(); StopSharing(); return 0; }
 
         // If a previous session is still active, resume that knowledge.
@@ -2059,9 +2318,11 @@ internal static class WifiShareApp
         {
             Settings.SharePath = saved.SharePath;
             Settings.ShareName = saved.ShareName;
+            Settings.ShareUserName = saved.ShareUserName;
             Settings.DnsSuffix = saved.DnsSuffix;
             Settings.HttpPort = saved.HttpPort;
-            _sharingActive = true;
+            _sharingActive = false;
+            Log.Warn("Saved network session found. DHCP/HTTP workers are stopped; use Stop/Restore before a new Start.");
         }
 
         MenuLoop();
@@ -2074,8 +2335,9 @@ internal static class WifiShareApp
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  WifiShare                 interactive menu");
-        Console.WriteLine("  WifiShare --start         start sharing with current/default settings");
+        Console.WriteLine("  WifiShare --start         configure sharing, then keep the menu/services running");
         Console.WriteLine("  WifiShare --stop          stop sharing and restore original settings");
+        Console.WriteLine("  WifiShare --setup-share   create/update SMB login without restarting networking");
         Console.WriteLine("  WifiShare --status        show adapters, IPs and sharing state");
         Console.WriteLine("  WifiShare --help          this text");
     }
@@ -2088,9 +2350,9 @@ internal static class WifiShareApp
             Ui.Banner();
             Console.WriteLine($"Status: {(_sharingActive ? "SHARING ACTIVE" : "idle")}");
             Console.WriteLine();
-            Console.WriteLine("  1. Start Sharing (ICS + static IP + DHCP + share folder)");
+            Console.WriteLine("  1. Start Sharing (custom-subnet NAT + client DHCP + share folder)");
             Console.WriteLine("  2. Stop / Restore original network settings");
-            Console.WriteLine("  3. Change settings (folder, share name, DNS suffix, HTTP port)");
+            Console.WriteLine("  3. Change settings (folder, share name, client DNS suffix, HTTP port)");
             Console.WriteLine("  4. Show current status (adapters, IPs, sharing state)");
             Console.WriteLine("  5. Exit");
             Console.ForegroundColor = ConsoleColor.White;
@@ -2098,6 +2360,11 @@ internal static class WifiShareApp
             Console.ResetColor();
             string? choice = null;
             try { choice = Console.ReadLine()?.Trim(); } catch { }
+            if (choice is null)
+            {
+                if (_sharingActive) StopSharing(quiet: true);
+                return;
+            }
 
             switch (choice)
             {
@@ -2127,306 +2394,243 @@ internal static class WifiShareApp
     // ---------------- option 1: START ----------------
     private static void StartSharing()
     {
-        if (_sharingActive)
+        if (_sharingActive || StateStore.Exists)
         {
-            Log.Warn("Sharing is already active. Use option 2 (Stop) first.");
+            Log.Warn("A saved sharing session exists. Use option 2 (Stop/Restore) before starting again.");
             return;
         }
-
-        Ui.Section("Step 1/7 — Detecting adapters");
-        var all = Adapters.ListAll();
-        Adapters.PrintTable(all);
-        var wifi = Adapters.DetectWifi(all);
-        var eth = Adapters.DetectEthernet(all);
-
-        if (wifi is null)
+        ShareState? state = null;
+        try
         {
-            Log.Error("No active Wi-Fi adapter with internet access found. Connect Wi-Fi first.");
-            return;
-        }
-        if (eth is null)
-        {
-            Log.Error("No Ethernet adapter found. Plug the cable / enable the adapter first.");
-            return;
-        }
-        Log.Ok($"Wi-Fi (internet/public):  '{wifi.Name}' ({wifi.Description})");
-        Log.Ok($"Ethernet (client/private): '{eth.Name}' ({eth.Description})");
-        if (Ui.PromptYesNo("Use these adapters?", true) == false)
-        {
-            string w = Ui.Prompt("Public Wi-Fi connection name", wifi.Name);
-            string e = Ui.Prompt("Private Ethernet connection name", eth.Name);
-            wifi = all.FirstOrDefault(a => a.Name.Equals(w, StringComparison.OrdinalIgnoreCase)) ?? wifi;
-            eth = all.FirstOrDefault(a => a.Name.Equals(e, StringComparison.OrdinalIgnoreCase)) ?? eth;
-        }
-
-        // Confirm the exact identity to apply (spec values are the defaults).
-        Ui.Section("Step 2/7 — Confirm Ethernet identity");
-        string ip = Ui.Prompt("IPv4 address", Defaults.HostIp);
-        string mask = Ui.Prompt("Subnet mask", Defaults.Mask);
-        string gw = Ui.Prompt("Default gateway (empty = none)", Defaults.Gateway);
-        string dns1 = Ui.Prompt("Primary DNS", Defaults.DnsPrimary);
-        string dns2 = Ui.Prompt("Secondary DNS (empty = none)", Defaults.DnsSecondary);
-        Settings.DnsSuffix = Ui.Prompt("Primary DNS suffix (connection-specific)", Settings.DnsSuffix);
-        bool spoofMac = Settings.SpoofMac &&
-                        Ui.PromptYesNo($"Spoof MAC to {Defaults.TargetMac}?", true);
-        if (string.IsNullOrWhiteSpace(gw)) gw = "";
-
-        // Plug-and-play for the client: our DHCP server hands out this pool
-        // (IP + mask + gateway + DNS + domain) the moment the cable is in.
-        Settings.StartDhcp = Ui.PromptYesNo("Run plug-and-play DHCP server for the client?", Settings.StartDhcp);
-        if (Settings.StartDhcp)
-        {
-            Settings.PoolStart = Ui.Prompt("DHCP pool start", Settings.PoolStart);
-            Settings.PoolEnd = Ui.Prompt("DHCP pool end", Settings.PoolEnd);
-            string lh = Ui.Prompt("DHCP lease time (hours)", Settings.LeaseHours.ToString());
-            if (int.TryParse(lh, out int h) && h >= 1 && h <= 720) Settings.LeaseHours = h;
-            else Log.Warn("Invalid lease time, keeping previous.");
-        }
-
-        // Snapshot originals BEFORE changing anything.
-        var state = new ShareState
-        {
-            PublicAdapterName = wifi.Name,
-            PublicAdapterId = wifi.Id,
-            PrivateAdapterName = eth.Name,
-            PrivateAdapterId = eth.Id,
-            HadStaticIp = eth.IPv4.Count > 0,
-            OrigIp = eth.IPv4.FirstOrDefault(),
-            OrigMask = eth.Masks.FirstOrDefault(),
-            OrigGateway = eth.Gateways.FirstOrDefault(),
-            OrigDns = new List<string>(eth.Dns),
-            OrigSuffix = IpConfig.GetConnectionSuffix(eth.Id),
-            SharePath = Settings.SharePath,
-            ShareName = Settings.ShareName,
-            DnsSuffix = Settings.DnsSuffix,
-            HttpPort = Settings.HttpPort,
-            StartedUtc = DateTimeOffset.UtcNow,
-        };
-        Log.Info($"Original Ethernet snapshot: IP={state.OrigIp ?? "DHCP/none"} " +
-                 $"GW={state.OrigGateway ?? "-"} DNS=[{string.Join(",", state.OrigDns)}] " +
-                 $"suffix='{state.OrigSuffix}'");
-
-        Ui.Section("Step 3/7 — Enabling Internet Connection Sharing");
-        // IMPORTANT ORDER: ICS first (it resets the private NIC to
-        // 192.168.137.1), then we override with the custom static identity.
-        if (!Ics.TryEnable(wifi.Name, wifi.Id, eth.Name, eth.Id, out string icsMsg))
-        {
-            Log.Error("ICS failed: " + icsMsg);
-            Log.Warn("Fix the cause above and retry; nothing else was changed.");
-            return;
-        }
-        Log.Ok(icsMsg);
-        state.IcsEnabledByUs = true;
-        Ui.Wait(2, "Waiting for ICS to settle");
-
-        Ui.Section("Step 4/7 — Applying static identity on Ethernet");
-        if (!IpConfig.SetStaticIp(eth.Name, ip, mask, gw))
-        {
-            Log.Error("Static IP failed. Disabling ICS again to leave things clean...");
-            Ics.TryDisable(out _);
-            return;
-        }
-        Log.Ok($"IP set: {ip} / {mask}  gateway {(string.IsNullOrEmpty(gw) ? "(none)" : gw)}");
-        if (!IpConfig.SetDns(eth.Name, dns1, string.IsNullOrWhiteSpace(dns2) ? null : dns2))
-            Log.Warn("DNS setup reported a problem; continuing anyway.");
-        else
-            Log.Ok($"DNS set: {dns1}" + (string.IsNullOrWhiteSpace(dns2) ? "" : $", {dns2}"));
-        if (IpConfig.SetConnectionSuffix(eth.Name, eth.Id, Settings.DnsSuffix))
-            Log.Ok($"DNS suffix set: '{Settings.DnsSuffix}'");
-        IpConfig.SetPrivateProfile(eth.Name);
-
-        if (spoofMac)
-        {
-            string? regKey = IpConfig.FindAdapterRegKey(eth.Id, eth.Description);
-            if (regKey is null)
+            Ui.Section("Step 1/5 — Select the internet and client adapters");
+            var all = Adapters.ListAll();
+            Adapters.PrintTable(all);
+            var wifi = Adapters.DetectWifi(all)
+                ?? throw new InvalidOperationException("Connect Wi-Fi first; it needs an IPv4 address and a default gateway.");
+            var eth = Adapters.DetectEthernet(all)
+                ?? throw new InvalidOperationException("No physical Ethernet adapter found. Check the cable and adapter.");
+            Log.Info($"Internet: '{wifi.Name}'; client cable: '{eth.Name}'.");
+            if (!Ui.PromptYesNo("Use these adapters?", true))
             {
-                Log.Warn("Adapter registry key not found; skipping MAC spoof.");
+                string w = Ui.Prompt("Internet Wi-Fi adapter name", wifi.Name);
+                string e = Ui.Prompt("Client Ethernet adapter name", eth.Name);
+                wifi = all.FirstOrDefault(a => a.Name.Equals(w, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new ArgumentException("Wi-Fi adapter name not found.");
+                eth = all.FirstOrDefault(a => a.Name.Equals(e, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new ArgumentException("Ethernet adapter name not found.");
             }
-            else
-            {
-                var (existed, oldVal) = IpConfig.GetMacOverride(regKey);
-                state.OrigMacOverrideExisted = existed;
-                state.OrigMacOverride = oldVal;
-                if (IpConfig.SetMacOverride(regKey, Defaults.TargetMac))
-                {
-                    state.MacSpoofedByUs = true;
-                    IpConfig.RestartAdapter(eth.Name);
-                    // Re-apply IP after the restart (some drivers reset it).
-                    IpConfig.SetStaticIp(eth.Name, ip, mask, gw);
-                    IpConfig.SetDns(eth.Name, dns1, string.IsNullOrWhiteSpace(dns2) ? null : dns2);
-                }
-            }
-        }
-        IpConfig.FlushDns();
-        StateStore.Save(state); // persist early: later steps may still fail
+            if (wifi.Id == eth.Id || wifi.Type != NetworkInterfaceType.Wireless80211 ||
+                eth.Type != NetworkInterfaceType.Ethernet)
+                throw new ArgumentException("Select distinct Wi-Fi and Ethernet adapters.");
+            if (wifi.Status != OperationalStatus.Up || eth.Status != OperationalStatus.Up)
+                throw new InvalidOperationException("Both adapters must be connected. Check that the client is powered on and the Ethernet cable is plugged in.");
+            if (eth.IPv4.Count(ip => !ip.StartsWith("169.254.")) > 1)
+                throw new InvalidOperationException("The Ethernet adapter has multiple IPv4 addresses. Use a dedicated client adapter.");
 
-        Ui.Section("Step 5/7 — Plug-and-play DHCP server");
-        bool dhcpOn = false;
-        if (Settings.StartDhcp &&
-            Ui.PromptYesNo($"Serve DHCP pool {Settings.PoolStart} - {Settings.PoolEnd} to the client?", true))
-        {
-            Sharing.OpenDhcpPort(open: true);
-            try
+            Ui.Section("Step 2/5 — Client address and laptop gateway");
+            string clientIp = Ui.Prompt("CLIENT IPv4 address (the PC at the other end of the cable)", Defaults.ClientIp);
+            string hostIp = Ui.Prompt("LAPTOP Ethernet IPv4 / client's gateway (must be different)", Defaults.HostIp);
+            var plan = new LanPlan(hostIp, clientIp);
+            var overlap = all.FirstOrDefault(a => a.Id != eth.Id && plan.Overlaps(a));
+            if (overlap is not null)
+                throw new InvalidOperationException($"The LAN subnet overlaps '{overlap.Name}'. Use a different subnet or disconnect the conflicting network.");
+            string dns1 = Ui.Prompt("Client primary DNS (from Wi-Fi)", wifi.Dns.FirstOrDefault() ?? Defaults.DnsPrimary);
+            string dns2 = Ui.Prompt("Client secondary DNS (type none to omit)", wifi.Dns.Skip(1).FirstOrDefault() ?? "none");
+            if (dns2.Equals("none", StringComparison.OrdinalIgnoreCase)) dns2 = "";
+            var dnsServers = new List<IPAddress> { IPAddress.Parse(dns1) };
+            if (dns2.Length > 0) dnsServers.Add(IPAddress.Parse(dns2));
+            if (dnsServers.Any(d => d.AddressFamily != AddressFamily.InterNetwork ||
+                IPAddress.IsLoopback(d) || d.Equals(IPAddress.Any) || d.ToString() == hostIp))
+                throw new ArgumentException("Use reachable upstream IPv4 DNS servers; the laptop does not run a DNS proxy in this mode.");
+            Settings.DnsSuffix = Ui.Prompt("Client DNS suffix (type none to omit)", Settings.DnsSuffix);
+            if (Settings.DnsSuffix.Equals("none", StringComparison.OrdinalIgnoreCase)) Settings.DnsSuffix = "";
+            Settings.StartDhcp = Ui.PromptYesNo($"Offer {clientIp} automatically to the single Ethernet client via DHCP?", true);
+            var scope = new DhcpScope(IPAddress.Parse(hostIp), IPAddress.Parse(LanPlan.Mask), IPAddress.Parse(hostIp),
+                dnsServers, Settings.DnsSuffix, IPAddress.Parse(clientIp), IPAddress.Parse(clientIp), Settings.LeaseHours * 3600);
+            LanNat.Preflight(wifi, eth, Settings.StartDhcp);
+            LanNat.Require(Sys.PowerShell(
+                $"if (Get-SmbShare -Name {Sys.PwshQuote(Settings.ShareName)} -ErrorAction SilentlyContinue) {{ throw 'The selected SMB share name already exists. Choose a different share name in Settings.' }}"),
+                "Check shared folder name");
+
+            // Persist recovery information before changing addresses or routing.
+            int originalIpIndex = eth.IPv4.FindIndex(ip => !ip.StartsWith("169.254."));
+            state = new ShareState
             {
-                var dnsServers = new List<IPAddress> { IPAddress.Parse(dns1) };
-                if (!string.IsNullOrWhiteSpace(dns2)) dnsServers.Add(IPAddress.Parse(dns2));
-                var scope = new DhcpScope(
-                    IPAddress.Parse(ip), IPAddress.Parse(mask), IPAddress.Parse(ip),
-                    dnsServers, Settings.DnsSuffix,
-                    IPAddress.Parse(Settings.PoolStart), IPAddress.Parse(Settings.PoolEnd),
-                    Settings.LeaseHours * 3600);
-                _dhcp?.Dispose();
+                PublicAdapterName = wifi.Name, PublicAdapterId = wifi.Id,
+                PrivateAdapterName = eth.Name, PrivateAdapterId = eth.Id,
+                HadStaticIp = Adapters.ShouldRestoreStatic(eth),
+                OrigIp = originalIpIndex >= 0 ? eth.IPv4[originalIpIndex] : null,
+                OrigMask = originalIpIndex >= 0 ? eth.Masks[originalIpIndex] : null,
+                OrigGateway = eth.Gateways.FirstOrDefault(), OrigDns = new List<string>(eth.Dns),
+                OrigDnsAutomatic = IpConfig.IsDnsAutomatic(eth.Id),
+                OrigSuffix = IpConfig.GetConnectionSuffix(eth.Id),
+                OrigPublicForwarding = LanNat.GetForwarding(wifi.Name),
+                OrigPrivateForwarding = LanNat.GetForwarding(eth.Name),
+                SharePath = Settings.SharePath, ShareName = Settings.ShareName, ShareCreatedByUs = false,
+                ShareUserName = Settings.ShareUserName,
+                DnsSuffix = Settings.DnsSuffix, HttpPort = Settings.HttpPort,
+                HostIp = hostIp, HostMask = LanPlan.Mask,
+                NatName = LanNat.CreateName(),
+                StartedUtc = DateTimeOffset.UtcNow,
+            };
+            StateStore.Save(state);
+
+            Ui.Section("Step 3/5 — Configure the laptop and subnet routing");
+            // The laptop uses Wi-Fi's default route. Its Ethernet has no gateway.
+            if (!IpConfig.SetStaticIp(eth.Name, hostIp, LanPlan.Mask, null))
+                throw new InvalidOperationException("Could not assign the laptop's Ethernet address.");
+            LanNat.Require(Sys.Netsh($"interface ip set dnsservers name=\"{eth.Name}\" source=dhcp"), "Clear stale Ethernet DNS");
+            bool addressReady = false;
+            for (int attempt = 0; attempt < 15; attempt++)
+            {
+                var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Id == eth.Id);
+                addressReady = nic?.GetIPProperties().UnicastAddresses.Any(a =>
+                    a.Address.ToString() == hostIp && a.DuplicateAddressDetectionState == DuplicateAddressDetectionState.Preferred) == true;
+                if (addressReady) break;
+                Thread.Sleep(1000);
+            }
+            if (!addressReady) throw new InvalidOperationException("The laptop's LAN address did not become ready. Check for a duplicate IP on the cable.");
+            if (Adapters.ListAll().First(a => a.Id == eth.Id).Gateways.Count != 0)
+                throw new InvalidOperationException("A stale Ethernet default gateway remains. The client-facing adapter must have no default gateway.");
+            LanNat.Create(state, plan);
+            IpConfig.SetPrivateProfile(eth.Name);
+            Log.Ok($"NAT active for {plan.Prefix}; laptop gateway {hostIp}; client {clientIp}.");
+
+            Ui.Section("Step 4/5 — Client address assignment");
+            if (Settings.StartDhcp)
+            {
+                if (!Sharing.OpenDhcpPort(true, eth.Name)) throw new InvalidOperationException("Could not open the Ethernet DHCP firewall rules.");
                 _dhcp = new DhcpServer(scope);
-                if (_dhcp.Start(out string dm))
-                {
-                    dhcpOn = true;
-                    state.DhcpStartedByUs = true;
-                    StateStore.Save(state);
-                    Log.Ok("DHCP server: " + dm);
-                    Log.Info("Client plug-and-play: just plug the cable, no manual TCP/IP setup needed.");
-                }
-                else
-                {
-                    Log.Error("DHCP server failed: " + dm);
-                    Log.Warn("Continuing without DHCP; the client must use the static IP below.");
-                    _dhcp?.Dispose();
-                    _dhcp = null;
-                }
+                if (!_dhcp.Start(out string message)) throw new InvalidOperationException(message);
+                state.DhcpStartedByUs = true;
+                StateStore.Save(state);
+                Log.Ok(message);
+                Log.Info("Waiting for the client: DHCP OFFER and ACK messages will appear here.");
             }
-            catch (Exception ex)
+            else Log.Info($"Static client setup required: {clientIp}/24, gateway {hostIp}, DNS {dns1}.");
+
+            Ui.Section("Step 5/5 — Shared files");
+            Sharing.EnsureFirewallAndServices();
+            Sharing.ConfigureLanRules(eth.Name, true);
+            state.ShareCreatedByUs = true;
+            StateStore.Save(state);
+            bool smbOn = Sharing.EnsureShare(Settings.SharePath, Settings.ShareName);
+            if (!smbOn)
+                Log.Warn("SMB setup failed; network routing remains available.");
+            _http?.Dispose();
+            _http = null;
+            bool httpOn = false;
+            if (Settings.StartHttpServer && Ui.PromptYesNo($"Start HTTP file server on port {Settings.HttpPort}?", true))
             {
-                Log.Error("DHCP setup failed: " + ex.Message);
-                Log.Warn("Continuing without DHCP; the client must use the static IP below.");
+                Sharing.OpenHttpPort(Settings.HttpPort, true, eth.Name);
+                _http = new HttpFileServer(Settings.SharePath, Settings.HttpPort, hostIp);
+                httpOn = _http.Start(out string message);
+                if (httpOn) Log.Ok(message);
+                else { Log.Warn(message); _http.Dispose(); _http = null; }
             }
+            _sharingActive = true;
+            StateStore.Save(state);
+            Log.Ok("Host configuration ready. Client connectivity still needs the checks below.");
+            ClientHelp.Print(hostIp, Settings.ShareName, Settings.HttpPort, httpOn, dns1, dns2,
+                Settings.StartDhcp, clientIp, clientIp, Settings.DnsSuffix);
+            if (smbOn) Sharing.PrintShareLogin(hostIp, Settings.ShareName);
         }
-
-        Ui.Section("Step 6/7 — File sharing (SMB) + optional HTTP server");
-        Sharing.EnsureFirewallAndServices();
-        bool shareOk = Sharing.EnsureShare(Settings.SharePath, Settings.ShareName);
-        if (!shareOk) Log.Warn("Continuing without SMB share; HTTP server may still help.");
-
-        _http?.Dispose();
-        _http = null;
-        bool httpOn = false;
-        if (Settings.StartHttpServer &&
-            Ui.PromptYesNo($"Start HTTP file server on port {Settings.HttpPort}?", true))
+        catch (Exception ex)
         {
-            Sharing.OpenHttpPort(Settings.HttpPort, open: true);
-            _http = new HttpFileServer(Settings.SharePath, Settings.HttpPort);
-            if (_http.Start(out string hm))
+            Log.Error("Start failed: " + ex.Message);
+            if (state is not null && StateStore.Exists)
             {
-                httpOn = true;
-                Log.Ok("HTTP server: " + hm);
-            }
-            else
-            {
-                Log.Error("HTTP server failed: " + hm);
-                _http.Dispose();
-                _http = null;
+                Log.Warn("Restoring the saved network settings after the failed start...");
+                StopSharing(quiet: true);
             }
         }
-
-        _sharingActive = true;
-        Ui.Section("Step 7/7 — Done");
-        Log.Ok($"Host Ethernet is now {ip}  (client gateway/DNS target).");
-        Log.Info("Driver-bound fields are read-only on Windows: " +
-                 $"Description='{eth.Description}', speed={Adapters.FormatSpeed(eth.SpeedBps)} " +
-                 "(see README limitations). Ethernet is unencrypted at L2 by nature.");
-        ClientHelp.Print(ip, Settings.ShareName, Settings.HttpPort, httpOn, dns1, dns2,
-                         dhcpOn, Settings.PoolStart, Settings.PoolEnd, Settings.DnsSuffix);
     }
-
     // ---------------- option 2: STOP / RESTORE ----------------
     private static void StopSharing(bool quiet = false)
     {
         var state = StateStore.Load();
-        string ethName = state?.PrivateAdapterName ??
-                         Adapters.DetectEthernet(Adapters.ListAll())?.Name ?? "";
-
-        if (state is null && !_sharingActive)
-        {
-            Log.Warn("No saved session found. Attempting best-effort cleanup anyway...");
-        }
-
-        Ui.Section("Stopping share & restoring originals");
-
-        try { _http?.Dispose(); } catch { }
-        _http = null;
-        if (state is not null) Sharing.OpenHttpPort(state.HttpPort, open: false);
-
-        // Stop our DHCP server first: the client keeps its last lease until it
-        // expires, so plug-and-play degrades gracefully instead of breaking.
-        try { _dhcp?.Dispose(); } catch { }
-        _dhcp = null;
-        Sharing.OpenDhcpPort(open: false);
-
-        if (!string.IsNullOrEmpty(state?.ShareName)) Sharing.RemoveShare(state.ShareName);
-        Log.Info($"Shared folder kept on disk: {state?.SharePath ?? Settings.SharePath}");
-
-        if (state?.IcsEnabledByUs == true || state is null)
-        {
-            if (Ics.TryDisable(out string m)) Log.Ok(m);
-            else Log.Warn(m);
-        }
-
-        if (!string.IsNullOrEmpty(ethName))
-        {
-            // MAC first (needs an adapter restart), then IP/DNS/suffix.
-            if (state?.MacSpoofedByUs == true)
-            {
-                var fresh = Adapters.ListAll().FirstOrDefault(a =>
-                    a.Name.Equals(ethName, StringComparison.OrdinalIgnoreCase));
-                string? key = IpConfig.FindAdapterRegKey(
-                    state.PrivateAdapterId ?? fresh?.Id, fresh?.Description ?? "");
-                if (key is not null)
-                {
-                    IpConfig.ClearMacOverride(key, state.OrigMacOverrideExisted, state.OrigMacOverride);
-                    IpConfig.RestartAdapter(ethName);
-                }
-            }
-
-            if (state is not null && state.HadStaticIp && !string.IsNullOrEmpty(state.OrigIp))
-            {
-                IpConfig.SetStaticIp(ethName, state.OrigIp,
-                    string.IsNullOrEmpty(state.OrigMask) ? "255.255.255.0" : state.OrigMask,
-                    state.OrigGateway);
-                if (state.OrigDns.Count > 0)
-                    IpConfig.SetDns(ethName, state.OrigDns[0],
-                        state.OrigDns.Count > 1 ? state.OrigDns[1] : null);
-                else
-                    Sys.Netsh($"interface ip set dnsservers name=\"{ethName}\" source=dhcp");
-            }
-            else
-            {
-                IpConfig.SetDhcp(ethName);
-            }
-
-            if (state is not null)
-                IpConfig.SetConnectionSuffix(ethName, state.PrivateAdapterId, state.OrigSuffix ?? "");
-            IpConfig.FlushDns();
-        }
-
-        StateStore.Clear();
+        _http?.Dispose(); _http = null;
+        _dhcp?.Dispose(); _dhcp = null;
         _sharingActive = false;
-        Log.Ok("Restore complete: ICS off, Ethernet back to original/DHCP, share removed.");
+        if (state is null)
+        {
+            Log.Warn("No saved session. No system network configuration was changed.");
+            return;
+        }
+        Ui.Section("Stopping share & restoring originals");
+        bool ok = Sharing.OpenDhcpPort(false);
+        ok &= Sharing.ConfigureLanRules(state.PrivateAdapterName, false);
+        Sharing.OpenHttpPort(state.HttpPort, false);
+        if (state.NatName is not null)
+        {
+            if (!LanNat.Restore(state))
+            {
+                Log.Error("Recovery information kept. Retry Stop/Restore as Administrator.");
+                return;
+            }
+        }
+        else if (state.IcsEnabledByUs)
+        {
+            if (Ics.TryDisable(out string message)) Log.Ok(message);
+            else { Log.Error(message); ok = false; }
+        }
+        if (state.MacSpoofedByUs)
+        {
+            string? key = IpConfig.FindAdapterRegKey(state.PrivateAdapterId, "");
+            if (key is not null)
+            {
+                IpConfig.ClearMacOverride(key, state.OrigMacOverrideExisted, state.OrigMacOverride);
+                IpConfig.RestartAdapter(state.PrivateAdapterName);
+            }
+            else ok = false;
+        }
+        // Older builds accidentally saved APIPA as static. Restore those to DHCP,
+        // never recreate the invalid link-local IP + off-subnet gateway pairing.
+        bool restoreStatic = state.HadStaticIp && !string.IsNullOrEmpty(state.OrigIp) &&
+                             !state.OrigIp.StartsWith("169.254.", StringComparison.Ordinal);
+        if (restoreStatic)
+            ok &= IpConfig.SetStaticIp(state.PrivateAdapterName, state.OrigIp!,
+                string.IsNullOrEmpty(state.OrigMask) ? LanPlan.Mask : state.OrigMask, state.OrigGateway);
+        else
+            ok &= IpConfig.SetDhcp(state.PrivateAdapterName);
+        bool automaticDns = state.OrigDnsAutomatic ?? (!restoreStatic || state.OrigDns.Count == 0);
+        if (!automaticDns && state.OrigDns.Count > 0)
+            ok &= IpConfig.SetDns(state.PrivateAdapterName, state.OrigDns[0],
+                state.OrigDns.Count > 1 ? state.OrigDns[1] : null);
+        else
+            ok &= Sys.Netsh($"interface ip set dnsservers name=\"{state.PrivateAdapterName}\" source=dhcp").Success;
+        if (state.NatName is null) // New NAT sessions don't change host suffix or MAC.
+            ok &= IpConfig.SetConnectionSuffix(state.PrivateAdapterName, state.PrivateAdapterId, state.OrigSuffix);
+        if (state.ShareCreatedByUs != false && !string.IsNullOrEmpty(state.ShareName)) Sharing.RemoveShare(state.ShareName);
+        Log.Info($"Shared folder kept: {state.SharePath}");
+        if (ok)
+        {
+            StateStore.Clear();
+            Log.Ok("Routing stopped; original Ethernet address/DNS restored.");
+        }
+        else Log.Error("Restore was incomplete. Saved recovery information kept; retry Stop/Restore.");
         if (!quiet) Ui.Pause();
     }
-
     // ---------------- option 3: SETTINGS ----------------
     private static void ChangeSettings()
     {
         Ui.Section("Settings (applied on next Start; folder applies live if active)");
         Settings.SharePath = Ui.Prompt("Shared folder path", Settings.SharePath);
         Settings.ShareName = Ui.Prompt("SMB share name", Settings.ShareName);
+        string userName = Ui.Prompt("SMB username", Settings.ShareUserName);
+        string password = Ui.PromptPassword(Settings.SharePassword);
+        try
+        {
+            Sharing.ValidateShareCredentials(userName, password);
+            Settings.ShareUserName = userName;
+            Settings.SharePassword = password;
+        }
+        catch (ArgumentException ex) { Log.Warn(ex.Message + " Keeping the previous SMB credentials."); }
         Settings.DnsSuffix = Ui.Prompt("Primary DNS suffix", Settings.DnsSuffix);
         string port = Ui.Prompt("HTTP port", Settings.HttpPort.ToString());
         if (int.TryParse(port, out int p) && p is > 0 and < 65536) Settings.HttpPort = p;
         else Log.Warn("Invalid port, keeping previous.");
         Settings.StartHttpServer = Ui.PromptYesNo("Offer HTTP file server on Start?", Settings.StartHttpServer);
-        Settings.SpoofMac = Ui.PromptYesNo("Offer MAC spoof on Start?", Settings.SpoofMac);
-        Settings.StartDhcp = Ui.PromptYesNo("Offer plug-and-play DHCP server on Start?", Settings.StartDhcp);
-        Settings.PoolStart = Ui.Prompt("DHCP pool start", Settings.PoolStart);
-        Settings.PoolEnd = Ui.Prompt("DHCP pool end", Settings.PoolEnd);
         string lh = Ui.Prompt("DHCP lease time (hours)", Settings.LeaseHours.ToString());
         if (int.TryParse(lh, out int h) && h >= 1 && h <= 720) Settings.LeaseHours = h;
         else Log.Warn("Invalid lease time, keeping previous.");
@@ -2442,9 +2646,11 @@ internal static class WifiShareApp
             {
                 state.SharePath = Settings.SharePath;
                 state.ShareName = Settings.ShareName;
+                state.ShareUserName = Settings.ShareUserName;
                 StateStore.Save(state);
+                Sharing.PrintShareLogin(state.HostIp, state.ShareName);
                 try { _http?.Dispose(); } catch { }
-                _http = new HttpFileServer(Settings.SharePath, state.HttpPort);
+                _http = new HttpFileServer(Settings.SharePath, state.HttpPort, state.HostIp);
                 if (_http.Start(out string hm)) Log.Ok("HTTP server restarted: " + hm);
                 else { Log.Warn("HTTP restart failed: " + hm); _http = null; }
             }
@@ -2459,7 +2665,8 @@ internal static class WifiShareApp
         Adapters.PrintTable(all);
 
         Ui.Section("Internet Connection Sharing");
-        var entries = Ics.GetStatus();
+        var entries = Ics.GetStatus(out string? icsError);
+        if (icsError is not null) Log.Warn("ICS status: " + icsError);
         if (entries.Count == 0)
             Log.Info("(ICS unavailable or no connections enumerated.)");
         foreach (var e in entries)
@@ -2470,6 +2677,15 @@ internal static class WifiShareApp
 
         Ui.Section("SMB shares");
         Console.WriteLine(Sharing.GetShareTable());
+
+        Ui.Section("LAN routing and DHCP diagnostics");
+        var diagnostic = Sys.PowerShell(
+            "Get-NetNat | Format-Table Name,InternalIPInterfaceAddressPrefix,Active; " +
+            "Get-Service SharedAccess,Dhcp | Format-Table Name,Status; " +
+            "Get-NetConnectionProfile | Format-Table InterfaceAlias,NetworkCategory,IPv4Connectivity; " +
+            "Get-NetUDPEndpoint -LocalPort 67 -ErrorAction SilentlyContinue | Format-Table LocalAddress,LocalPort,OwningProcess");
+        Console.WriteLine(diagnostic.StdOut);
+        if (!diagnostic.Success) Log.Warn(diagnostic.StdErr);
 
         Ui.Section("DHCP server (plug-and-play)");
         if (_dhcp?.Running == true)
@@ -2494,7 +2710,7 @@ internal static class WifiShareApp
         {
             Console.WriteLine($"  Started (UTC): {s.StartedUtc:u}");
             Console.WriteLine($"  Public:  {s.PublicAdapterName}");
-            Console.WriteLine($"  Private: {s.PrivateAdapterName}  ICS={s.IcsEnabledByUs} MACspoof={s.MacSpoofedByUs}");
+            Console.WriteLine($"  Private: {s.PrivateAdapterName}  NAT={s.NatName ?? "legacy ICS"}  Host={s.HostIp}");
             Console.WriteLine($"  Orig IP: {s.OrigIp ?? "DHCP/none"}  Orig DNS: [{string.Join(",", s.OrigDns)}]  Orig suffix: '{s.OrigSuffix}'");
             Console.WriteLine($"  Share:   \\\\{Environment.MachineName}\\{s.ShareName}  <-  {s.SharePath}");
         }

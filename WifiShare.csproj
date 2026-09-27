@@ -16,8 +16,13 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AssemblyName>WifiShare</AssemblyName>
     <RootNamespace>WifiShare</RootNamespace>
-    <Version>1.0.0</Version>
-    <Description>Share laptop Wi-Fi over Ethernet (ICS) with static identity + file sharing.</Description>
+    <Version>1.1.2</Version>
+    <Description>Share laptop Wi-Fi over Ethernet with a dedicated client subnet, NAT, DHCP and file sharing.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+    <InternalsVisibleTo Include="WifiShare.Tests" />
+  </ItemGroup>
 
 </Project>
