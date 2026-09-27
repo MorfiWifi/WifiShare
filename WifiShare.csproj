@@ -16,7 +16,14 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AssemblyName>WifiShare</AssemblyName>
     <RootNamespace>WifiShare</RootNamespace>
-    <Version>1.1.2</Version>
+    <!-- Base version for autoversioning. Local builds use this as-is (1.1.2).
+         CI appends the GitHub run number on the `release` branch:
+           dotnet publish /p:Version=$(VersionPrefix).<run_number>
+         so every release build gets a unique version (e.g. 1.1.2.78) and the
+         GitHub Release is tagged v<that version>. Bump VersionPrefix here to
+         start a new series. No NuGet versioning packages required. -->
+    <VersionPrefix>1.1.2</VersionPrefix>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
     <Description>Share laptop Wi-Fi over Ethernet with a dedicated client subnet, NAT, DHCP and file sharing.</Description>
   </PropertyGroup>
 

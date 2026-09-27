@@ -1,0 +1,154 @@
+# WifiShare — Windows self-contained publish on push to `release`.
+#
+# AOT verdict: NOT used (verified 2026-09-27).
+#   - Program.cs uses built-in COM interop ([ComImport] INetSharingManager +
+#     Marshal.ReleaseComObject) for ICS, which NativeAOT does not support
+#     (requires GeneratedComInterface/ComWrappers rewrite).
+#   - System.Text.Json uses reflection-based Serialize/Deserialize (IL2026/IL3050)
+#     without a JsonSerializerContext (source generation).
+#   - `dotnet publish -r win-x64 /p:PublishAot=true` fails on Linux with
+#     "Cross-OS native compilation is not supported" (AOT must build on Windows).
+#   Self-contained single-file publish was verified working instead
+#   (win-x64 -> ~71 MB WifiShare.exe), so this workflow publishes
+#   win-x86 / win-x64 / win-arm64 as self-contained single files.
+#
+# Autoversioning: no tags or version packages needed. The `version` job reads
+#   <VersionPrefix> from WifiShare.csproj (e.g. 1.1.2) and appends the GitHub
+#   run number -> 1.1.2.<run_number>. That version is passed to
+#   dotnet publish (/p:Version, AssemblyVersion, FileVersion,
+#   InformationalVersion incl. short SHA) and reused as the GitHub Release tag
+#   (v1.1.2.<run_number>). Bump <VersionPrefix> in the csproj for a new series.
+#
+# Trigger: push to branch `release` (or manual Run workflow).
+
+name: Release Windows (self-contained)
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: 10.0.x
+  PROJECT: WifiShare.csproj
+  CONFIG: Release
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.resolve.outputs.base }}
+      version: ${{ steps.resolve.outputs.version }}
+      informational: ${{ steps.resolve.outputs.informational }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version (<VersionPrefix>.<run_number>)
+        id: resolve
+        run: |
+          BASE=$(grep -oPm1 '(?<=<VersionPrefix>)[^<]+' WifiShare.csproj | tr -d ' \r\n')
+          if [ -z "$BASE" ]; then echo "::error::Could not read <VersionPrefix> from WifiShare.csproj"; exit 1; fi
+          VERSION="$BASE.${{ github.run_number }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "informational=$VERSION+sha.$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (+sha.$SHORT_SHA)"
+
+  publish:
+    name: Publish ${{ matrix.rid }}
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x86, win-x64, win-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: .NET info
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore ${{ env.PROJECT }} -r ${{ matrix.rid }}
+
+      - name: Smoke test (unit logic, no admin needed)
+        # tests/Program.cs is a plain Exe test-runner, not `dotnet test`.
+        run: dotnet run --project tests/WifiShare.Tests.csproj -c ${{ env.CONFIG }}
+
+      - name: Publish self-contained single-file (${{ matrix.rid }})
+        run: >
+          dotnet publish ${{ env.PROJECT }} -c ${{ env.CONFIG }} -r ${{ matrix.rid }}
+          --self-contained true
+          /p:Version=${{ needs.version.outputs.version }}
+          /p:AssemblyVersion=${{ needs.version.outputs.version }}
+          /p:FileVersion=${{ needs.version.outputs.version }}
+          /p:InformationalVersion=${{ needs.version.outputs.informational }}
+          /p:PublishSingleFile=true
+          /p:IncludeNativeLibrariesForSelfExtract=true
+          /p:PublishTrimmed=false
+          /p:PublishAot=false
+          /p:DebugSymbols=false
+          /p:DebugType=None
+          -o publish/${{ matrix.rid }}
+
+      - name: List output
+        run: Get-ChildItem -Recurse publish/${{ matrix.rid }}
+        shell: pwsh
+
+      - name: Zip output
+        run: Compress-Archive -Path publish/${{ matrix.rid }}/* -DestinationPath WifiShare-${{ needs.version.outputs.version }}-${{ matrix.rid }}.zip -Force
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WifiShare-${{ needs.version.outputs.version }}-${{ matrix.rid }}
+          path: WifiShare-${{ needs.version.outputs.version }}-${{ matrix.rid }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [publish, version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artifacts
+        run: ls -R dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: WifiShare v${{ needs.version.outputs.version }} (Windows self-contained)
+          body: |
+            Self-contained single-file Windows builds from `release` branch (${{ github.sha }}).
+
+            Version: `${{ needs.version.outputs.informational }}` (base `<VersionPrefix>` + run number).
+
+            | File | RID | Notes |
+            | ---- | --- | ----- |
+            | WifiShare-${{ needs.version.outputs.version }}-win-x86.zip | win-x86 | 32-bit Windows, self-contained, no runtime install needed |
+            | WifiShare-${{ needs.version.outputs.version }}-win-x64.zip | win-x64 | 64-bit Intel/AMD Windows, self-contained |
+            | WifiShare-${{ needs.version.outputs.version }}-win-arm64.zip | win-arm64 | ARM64 Windows (Snapdragon / Surface), self-contained |
+
+            Run as Administrator. No .NET runtime install required.
+            NativeAOT is NOT used (COM-based ICS + reflection JSON are AOT-incompatible).
+          files: dist/**/*.zip
+          draft: false
+          prerelease: false
